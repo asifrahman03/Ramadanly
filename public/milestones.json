@@ -1,7 +1,7 @@
 {
-  "idea_locked": false,
-  "first_screen": false,
-  "features_added": false,
+  "idea_locked": true,
+  "first_screen": true,
+  "features_added": true,
   "deployed": false,
   "shared": false
 }

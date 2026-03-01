@@ -42,18 +42,18 @@ const instrumentSerif = Instrument_Serif({
 });
 
 export const metadata: Metadata = {
-  title: "makesomething ☀️",
-  description: "build your first app with ai. look what i made!",
+  title: "Ramadanly",
+  description: "elite discipline for salah and focus",
   metadataBase: new URL("https://makesomething.so"),
   openGraph: {
-    title: "makesomething ☀️",
-    description: "look what i made!",
-    siteName: "makesomething",
+    title: "Ramadanly",
+    description: "elite discipline for salah and focus",
+    siteName: "Ramadanly",
   },
   twitter: {
     card: "summary_large_image",
-    title: "makesomething ☀️",
-    description: "look what i made!",
+    title: "Ramadanly",
+    description: "elite discipline for salah and focus",
   },
 };
 
