@@ -1,8 +1,9 @@
 "use client";
 
-import { Button, Card, CardBody, Checkbox, Chip, Input, Progress, Select, SelectItem } from "@heroui/react";
+import { Button, Card, CardBody, Checkbox, Chip, Input, Progress } from "@heroui/react";
 import { motion } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import NextLink from "next/link";
 
 type PrayerName = "fajr" | "dhuhr" | "asr" | "maghrib" | "isha";
 
@@ -18,7 +19,7 @@ type PrayerCard = {
 
 type CompletionMap = Record<PrayerName, boolean>;
 
-type PrayerStatus = "upcoming" | "missed" | "completed";
+type PrayerStatus = "upcoming" | "due" | "missed" | "completed";
 type StatusColor = "warning" | "danger" | "success";
 
 type AladhanTimingResponse = {
@@ -39,22 +40,13 @@ type ReverseGeoResponse = {
   principalSubdivision?: string;
   countryName?: string;
 };
+type SavedLocation = { city: string; country: string };
 
 const ALADHAN_API_BASE_URL = "https://api.aladhan.com/v1/timingsByCity";
 const BIGDATACLOUD_BASE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client";
-const countryOptions = [
-  "United States",
-  "Canada",
-  "United Kingdom",
-  "Saudi Arabia",
-  "Pakistan",
-  "India",
-  "United Arab Emirates",
-  "Egypt",
-  "Turkey",
-  "Malaysia",
-  "Indonesia",
-];
+const LOCATION_STORAGE_KEY = "ramadanly-location";
+const REMINDER_OFFSETS_STORAGE_KEY = "ramadanly-reminder-offsets";
+const REMINDERS_ENABLED_STORAGE_KEY = "ramadanly-reminders-enabled";
 const pillarClasses = [
   "h-32 w-10",
   "h-44 w-12",
@@ -117,16 +109,32 @@ const defaultCompletion: CompletionMap = {
   maghrib: false,
   isha: false,
 };
+const defaultReminderOffsets: Record<PrayerName, number> = {
+  fajr: 10,
+  dhuhr: 10,
+  asr: 10,
+  maghrib: 10,
+  isha: 10,
+};
+const defaultReminderFired: Record<PrayerName, boolean> = {
+  fajr: false,
+  dhuhr: false,
+  asr: false,
+  maghrib: false,
+  isha: false,
+};
 
 const statusStyle: Record<PrayerStatus, StatusColor> = {
   upcoming: "warning",
+  due: "warning",
   missed: "danger",
   completed: "success",
 };
 const statusChipClass: Record<PrayerStatus, string> = {
   upcoming: "bg-amber-300/20 text-amber-200 border border-amber-300/30",
+  due: "bg-amber-300/20 text-amber-200 border border-amber-300/30",
   missed: "bg-rose-300/20 text-rose-200 border border-rose-300/30",
-  completed: "bg-white/12 text-white border border-white/35",
+  completed: "bg-green-300/20 text-green-200 border border-green-300/30",
 };
 
 const localDateKey = () => {
@@ -186,32 +194,114 @@ const getCompletionForKey = (dayKey: string) => {
   }
 };
 
+const getReminderOffsets = () => {
+  if (typeof window === "undefined") return defaultReminderOffsets;
+  const saved = window.localStorage.getItem(REMINDER_OFFSETS_STORAGE_KEY);
+  if (!saved) return defaultReminderOffsets;
+
+  try {
+    return {
+      ...defaultReminderOffsets,
+      ...(JSON.parse(saved) as Partial<Record<PrayerName, number>>),
+    };
+  } catch {
+    return defaultReminderOffsets;
+  }
+};
+
+const getReminderFiredForKey = (dayKey: string) => {
+  if (typeof window === "undefined") return defaultReminderFired;
+  const saved = window.localStorage.getItem(`ramadanly-reminder-fired-${dayKey}`);
+  if (!saved) return defaultReminderFired;
+
+  try {
+    return {
+      ...defaultReminderFired,
+      ...(JSON.parse(saved) as Partial<Record<PrayerName, boolean>>),
+    };
+  } catch {
+    return defaultReminderFired;
+  }
+};
+
 const getDuePrayer = (now: Date, completion: CompletionMap, cards: PrayerCard[]) => {
   const nowMins = now.getHours() * 60 + now.getMinutes();
-  return cards.find((prayer) => nowMins >= toMinutes(prayer.time24) && !completion[prayer.id]) ?? null;
+  return (
+    cards.find((prayer, index) => {
+      if (completion[prayer.id]) return false;
+      const prayerStart = toMinutes(prayer.time24);
+      const nextPrayer = cards[index + 1];
+      const nextPrayerStart = nextPrayer ? toMinutes(nextPrayer.time24) : Number.POSITIVE_INFINITY;
+      return nowMins >= prayerStart && nowMins < nextPrayerStart;
+    }) ?? null
+  );
 };
 
 export default function Home() {
   const [now, setNow] = useState(() => new Date());
+  const [dayKey, setDayKey] = useState(() => localDateKey());
   const [completion, setCompletion] = useState<CompletionMap>(() => getCompletionForKey(localDateKey()));
+  const [reminderOffsets, setReminderOffsets] = useState<Record<PrayerName, number>>(() => getReminderOffsets());
+  const [remindersEnabled, setRemindersEnabled] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(REMINDERS_ENABLED_STORAGE_KEY) === "true";
+  });
+  const [reminderFired, setReminderFired] = useState<Record<PrayerName, boolean>>(() =>
+    getReminderFiredForKey(localDateKey()),
+  );
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) return "denied";
+    return window.Notification.permission;
+  });
+  const [reminderMessage, setReminderMessage] = useState("");
   const [confirmPrayerId, setConfirmPrayerId] = useState<PrayerName | null>(null);
   const [prayerCards, setPrayerCards] = useState<PrayerCard[]>(fallbackPrayerCards);
   const [locationLine, setLocationLine] = useState("syncing your city prayer times...");
   const [timesError, setTimesError] = useState<string | null>(null);
-  const [manualCity, setManualCity] = useState("");
-  const [manualCountry, setManualCountry] = useState("United States");
-  const [isManualLoading, setIsManualLoading] = useState(false);
   const [isLocating, setIsLocating] = useState(false);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const dragState = useRef({ isDown: false, startX: 0, scrollLeft: 0 });
-  const dayKey = useMemo(() => localDateKeyFromDate(now), [now]);
+  const reminderTimeoutsRef = useRef<number[]>([]);
+
+  const clearReminderTimeouts = useCallback(() => {
+    reminderTimeoutsRef.current.forEach((timeoutId) => window.clearTimeout(timeoutId));
+    reminderTimeoutsRef.current = [];
+  }, []);
+
+  const sendReminderNotification = useCallback(
+    (prayer: PrayerCard, offset: number) => {
+      if (typeof window === "undefined" || !("Notification" in window)) return;
+      if (window.Notification.permission !== "granted") return;
+
+      new window.Notification(`${prayer.name} in ${offset} minute${offset === 1 ? "" : "s"}`, {
+        body: `${prayer.name} athan is at ${prayer.timeLabel}.`,
+      });
+      setReminderFired((prev) => ({ ...prev, [prayer.id]: true }));
+    },
+    [],
+  );
 
   const loadPrayerTimes = useCallback(async () => {
     try {
       setIsLocating(true);
       setTimesError(null);
       setLocationLine("syncing your city prayer times...");
+      const savedLocationRaw = window.localStorage.getItem(LOCATION_STORAGE_KEY);
+      if (savedLocationRaw) {
+        const parsed = JSON.parse(savedLocationRaw) as SavedLocation;
+        if (parsed.city && parsed.country) {
+          const savedTimingsRes = await fetch(
+            `${ALADHAN_API_BASE_URL}?city=${encodeURIComponent(parsed.city)}&country=${encodeURIComponent(parsed.country)}&method=2`,
+          );
+          if (!savedTimingsRes.ok) throw new Error("unable to fetch prayer times");
+          const savedTimingsData = (await savedTimingsRes.json()) as AladhanTimingResponse;
+          setPrayerCards(buildPrayerCards(savedTimingsData.data.timings));
+          setLocationLine(`${parsed.city}, ${parsed.country}`);
+          return;
+        }
+      }
+
       const position = await new Promise<GeolocationPosition>((resolve, reject) => {
         navigator.geolocation.getCurrentPosition(resolve, reject, {
           enableHighAccuracy: true,
@@ -229,7 +319,6 @@ export default function Home() {
       const city = geoData.city ?? geoData.locality ?? geoData.principalSubdivision;
       const country = geoData.countryName;
       if (!city || !country) throw new Error("could not resolve city and country");
-      setManualCountry(country);
 
       const timingsRes = await fetch(
         `${ALADHAN_API_BASE_URL}?city=${encodeURIComponent(city)}&country=${encodeURIComponent(country)}&method=2`,
@@ -239,6 +328,7 @@ export default function Home() {
 
       setPrayerCards(buildPrayerCards(timingsData.data.timings));
       setLocationLine(`${city}, ${country}`);
+      window.localStorage.setItem(LOCATION_STORAGE_KEY, JSON.stringify({ city, country }));
     } catch {
       setPrayerCards(fallbackPrayerCards);
       setLocationLine("location sync unavailable - using fallback schedule");
@@ -248,27 +338,6 @@ export default function Home() {
     }
   }, []);
 
-  const onManualSearch = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!manualCity.trim()) return;
-
-    try {
-      setIsManualLoading(true);
-      setTimesError(null);
-      const timingsRes = await fetch(
-        `${ALADHAN_API_BASE_URL}?city=${encodeURIComponent(manualCity.trim())}&country=${encodeURIComponent(manualCountry)}&method=2`,
-      );
-      if (!timingsRes.ok) throw new Error("unable to fetch prayer times");
-      const timingsData = (await timingsRes.json()) as AladhanTimingResponse;
-      setPrayerCards(buildPrayerCards(timingsData.data.timings));
-      setLocationLine(`${manualCity.trim()}, ${manualCountry}`);
-    } catch {
-      setTimesError("couldn’t find that city. try format like: chicago");
-    } finally {
-      setIsManualLoading(false);
-    }
-  };
-
   useEffect(() => {
     const id = window.setInterval(() => {
       setNow((prev) => {
@@ -276,7 +345,9 @@ export default function Home() {
         const prevDay = localDateKeyFromDate(prev);
         const nextDay = localDateKeyFromDate(next);
         if (prevDay !== nextDay) {
+          setDayKey(nextDay);
           setCompletion(getCompletionForKey(nextDay));
+          setReminderFired(getReminderFiredForKey(nextDay));
           setConfirmPrayerId(null);
         }
         return next;
@@ -293,22 +364,104 @@ export default function Home() {
     window.localStorage.setItem(`ramadanly-completed-${dayKey}`, JSON.stringify(completion));
   }, [completion, dayKey]);
 
+  useEffect(() => {
+    window.localStorage.setItem(REMINDER_OFFSETS_STORAGE_KEY, JSON.stringify(reminderOffsets));
+  }, [reminderOffsets]);
+
+  useEffect(() => {
+    window.localStorage.setItem(REMINDERS_ENABLED_STORAGE_KEY, String(remindersEnabled));
+  }, [remindersEnabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem(`ramadanly-reminder-fired-${dayKey}`, JSON.stringify(reminderFired));
+  }, [dayKey, reminderFired]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("denied");
+      return;
+    }
+    setNotificationPermission(window.Notification.permission);
+  }, []);
+
+  useEffect(() => {
+    clearReminderTimeouts();
+    if (!remindersEnabled) return;
+    if (notificationPermission !== "granted") return;
+
+    const nowDate = new Date();
+    const nowMins = nowDate.getHours() * 60 + nowDate.getMinutes();
+
+    prayerCards.forEach((prayer) => {
+      if (reminderFired[prayer.id]) return;
+
+      const prayerMins = toMinutes(prayer.time24);
+      const offsetMins = Math.max(0, reminderOffsets[prayer.id] ?? 10);
+      const reminderMins = Math.max(0, prayerMins - offsetMins);
+
+      if (nowMins >= reminderMins && nowMins < prayerMins) {
+        sendReminderNotification(prayer, offsetMins);
+        return;
+      }
+
+      if (nowMins >= prayerMins) return;
+
+      const target = new Date();
+      target.setHours(Math.floor(reminderMins / 60), reminderMins % 60, 0, 0);
+      const delayMs = target.getTime() - nowDate.getTime();
+      if (delayMs <= 0) return;
+
+      const timeoutId = window.setTimeout(() => {
+        sendReminderNotification(prayer, offsetMins);
+      }, delayMs);
+      reminderTimeoutsRef.current.push(timeoutId);
+    });
+
+    return () => {
+      clearReminderTimeouts();
+    };
+  }, [
+    clearReminderTimeouts,
+    dayKey,
+    notificationPermission,
+    prayerCards,
+    reminderFired,
+    reminderOffsets,
+    remindersEnabled,
+    sendReminderNotification,
+  ]);
+
   const statuses = useMemo(() => {
     const nowMins = now.getHours() * 60 + now.getMinutes();
 
-    return prayerCards.reduce<Record<PrayerName, PrayerStatus>>((acc, prayer) => {
+    return prayerCards.reduce<Record<PrayerName, PrayerStatus>>((acc, prayer, index) => {
       if (completion[prayer.id]) {
         acc[prayer.id] = "completed";
         return acc;
       }
 
-      acc[prayer.id] = nowMins < toMinutes(prayer.time24) ? "upcoming" : "missed";
+      const prayerStart = toMinutes(prayer.time24);
+      const nextPrayer = prayerCards[index + 1];
+      const nextPrayerStart = nextPrayer ? toMinutes(nextPrayer.time24) : Number.POSITIVE_INFINITY;
+
+      if (nowMins < prayerStart) {
+        acc[prayer.id] = "upcoming";
+        return acc;
+      }
+
+      if (nowMins >= nextPrayerStart) {
+        acc[prayer.id] = "missed";
+        return acc;
+      }
+
+      acc[prayer.id] = "due";
       return acc;
     }, {} as Record<PrayerName, PrayerStatus>);
   }, [completion, now, prayerCards]);
 
-  const setPrayerCompleted = (id: PrayerName, isCompleted: boolean) =>
+  const setPrayerCompleted = (id: PrayerName, isCompleted: boolean) => {
     setCompletion((prev) => ({ ...prev, [id]: isCompleted }));
+  };
 
   const startDrag = (event: React.MouseEvent<HTMLDivElement>) => {
     const el = scrollerRef.current;
@@ -346,6 +499,30 @@ export default function Home() {
     setConfirmPrayerId(null);
   };
 
+  const setReminderOffset = (prayerId: PrayerName, value: string) => {
+    const parsed = Number(value);
+    const safeValue = Number.isFinite(parsed) ? Math.max(0, Math.min(180, Math.round(parsed))) : 0;
+    setReminderOffsets((prev) => ({ ...prev, [prayerId]: safeValue }));
+  };
+
+  const enableReminderNotifications = async () => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setReminderMessage("this browser doesn’t support notifications.");
+      return;
+    }
+
+    const permission = await window.Notification.requestPermission();
+    setNotificationPermission(permission);
+    if (permission !== "granted") {
+      setRemindersEnabled(false);
+      setReminderMessage("notifications are blocked. allow them in browser settings.");
+      return;
+    }
+
+    setRemindersEnabled(true);
+    setReminderMessage("reminders are on.");
+  };
+
   const reflectionLine = useMemo(() => {
     if (completedCount === 5) return "perfect score. you led your day and kept Allah first.";
     if (completedCount >= 3) return "solid discipline today. finish the night strong and close all five.";
@@ -354,80 +531,98 @@ export default function Home() {
   }, [completedCount]);
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_10%_20%,#4a1115_0%,#1a0d12_35%,#09080b_75%)] px-4 py-8 text-white sm:px-8 sm:py-10 font-[family-name:var(--font-space-grotesk)]">
+    <main className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_10%_20%,#4a1115_0%,#1a0d12_35%,#09080b_75%)] px-4 py-16 text-white sm:px-8 sm:py-10 font-[family-name:var(--font-space-grotesk)]">
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(135deg,rgba(255,130,78,0.18)_0%,rgba(255,130,78,0)_45%,rgba(117,220,155,0.12)_100%)]" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-40 bg-[linear-gradient(to_top,rgba(3,22,25,0.95),rgba(3,22,25,0))]" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 flex h-56 items-end justify-between px-2 opacity-70 sm:px-8">
-        {pillarClasses.map((pillarClass, index) => (
-          <div key={pillarClass + index} className="flex flex-col items-center justify-end">
-            <div className={`relative ${pillarClass} rounded-t-[999px] border border-amber-100/30 bg-[linear-gradient(to_top,rgba(216,145,75,0.35),rgba(34,26,24,0.8))]`}>
-              <div className="absolute left-1/2 top-3 h-1 w-2/3 -translate-x-1/2 rounded-full bg-amber-100/35" />
-              <div className="absolute left-1/2 top-8 h-[55%] w-[2px] -translate-x-1/2 bg-amber-100/25" />
-              <div className="absolute left-1/2 bottom-3 h-1 w-2/3 -translate-x-1/2 rounded-full bg-amber-100/25" />
-            </div>
-            <div className="h-2 w-[115%] rounded-sm bg-amber-100/20" />
-          </div>
-        ))}
-      </div>
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-16 bg-[repeating-radial-gradient(circle_at_22px_100%,rgba(248,200,126,0.22)_0_16px,transparent_16px_44px)] opacity-50" />
       <section className="relative mx-auto flex w-full max-w-6xl flex-col rounded-[2.2rem] border border-white/15 bg-black/35 px-6 py-8 shadow-[0_20px_80px_rgba(0,0,0,0.55)] backdrop-blur-xl sm:px-10 sm:py-10">
         <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <p className="text-xs uppercase tracking-[0.35em] text-amber-300/90">discipline mode</p>
-            <h1 className="mt-2 text-5xl font-bold tracking-tight text-white sm:text-6xl">Ramadanly</h1>
+            <h1 className="mt-2 text-5xl font-bold tracking-tight text-white sm:text-6xl">
+              Rama
+              <span className="bg-gradient-to-r from-amber-300 to-amber-600 bg-clip-text text-transparent">
+                danly
+              </span>
+            </h1>
             <p className="mt-2 max-w-2xl text-sm text-white/70 sm:text-base">
               real winners never miss salah. your work pauses until you answer the call.
             </p>
             <p className="mt-2 text-xs uppercase tracking-[0.16em] text-white/60">{locationLine}</p>
             {timesError && <p className="mt-2 text-xs text-rose-300">{timesError}</p>}
-            <form onSubmit={onManualSearch} className="mt-4 flex w-full max-w-3xl flex-col gap-2 sm:flex-row">
-              <Input
-                value={manualCity}
-                onValueChange={setManualCity}
-                placeholder="search city (ex: chicago)"
-                variant="bordered"
-                radius="md"
-                classNames={{
-                  input: "text-white",
-                  inputWrapper: "bg-white/5 border-white/20",
-                }}
-              />
-              <Select
-                aria-label="Country"
-                selectedKeys={[manualCountry]}
-                onSelectionChange={(keys) => {
-                  if (keys === "all") return;
-                  const selected = Array.from(keys)[0];
-                  if (selected) setManualCountry(String(selected));
-                }}
-                variant="bordered"
-                radius="md"
-                className="sm:max-w-[220px]"
-                classNames={{
-                  trigger: "bg-white/5 border-white/20",
-                  value: "text-white",
-                }}
-              >
-                {countryOptions.map((country) => (
-                  <SelectItem key={country}>{country}</SelectItem>
-                ))}
-              </Select>
-              <Button
-                type="submit"
-                isLoading={isManualLoading}
-                className="bg-white/10 text-white border border-white/20"
-              >
-                update times
-              </Button>
+            <div className="mt-4 flex w-full max-w-3xl flex-col gap-2 sm:flex-row">
               <Button
                 type="button"
                 onPress={() => void loadPrayerTimes()}
                 isLoading={isLocating}
-                className="bg-amber-300/20 text-amber-100 border border-amber-200/35"
+                size="lg"
+                className="h-12 px-6 text-base font-semibold bg-amber-300/20 text-amber-100 border border-amber-200/35"
               >
-                use my location
+                refresh prayer times
               </Button>
-            </form>
+              <Button
+                as={NextLink}
+                href="/setup-location"
+                size="lg"
+                className="h-12 px-6 text-base font-semibold bg-white/5 text-white border border-white/20"
+              >
+                setup location
+              </Button>
+            </div>
+            <Card className="mt-4 border border-white/15 bg-white/5 text-white">
+              <CardBody className="gap-4">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-white/80">pre-athan reminders (minutes before each prayer)</p>
+                  <div className="flex items-center gap-2">
+                    <Chip
+                      variant="flat"
+                      className={
+                        notificationPermission === "granted"
+                          ? "bg-green-300/20 text-green-200 border border-green-300/30"
+                          : "bg-amber-300/20 text-amber-200 border border-amber-300/30"
+                      }
+                    >
+                      {notificationPermission}
+                    </Chip>
+                    <Button
+                      size="sm"
+                      className="bg-amber-300/20 text-amber-100 border border-amber-200/35"
+                      onPress={() => void enableReminderNotifications()}
+                    >
+                      enable
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="bg-white/5 text-white border border-white/20"
+                      onPress={() => {
+                        setRemindersEnabled(false);
+                        setReminderMessage("reminders are off.");
+                      }}
+                    >
+                      turn off
+                    </Button>
+                  </div>
+                </div>
+                {reminderMessage && <p className="text-xs text-white/70">{reminderMessage}</p>}
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5">
+                  {prayerCards.map((prayer) => (
+                    <Input
+                      key={prayer.id}
+                      type="number"
+                      min={0}
+                      max={180}
+                      label={prayer.name}
+                      value={String(reminderOffsets[prayer.id] ?? 10)}
+                      onValueChange={(value) => setReminderOffset(prayer.id, value)}
+                      classNames={{
+                        label: "text-white/80",
+                        input: "text-white",
+                        inputWrapper: "bg-white/5 border-white/20",
+                      }}
+                    />
+                  ))}
+                </div>
+              </CardBody>
+            </Card>
           </div>
           <Card className="border border-white/15 bg-white/5 text-white sm:w-[320px]">
             <CardBody className="gap-3">
@@ -532,10 +727,15 @@ export default function Home() {
               </Card>
               <Checkbox
                 isSelected={confirmDone}
-                onValueChange={(isSelected) => setConfirmPrayerId(isSelected ? lockedPrayer.id : null)}
+                onValueChange={(isSelected) =>
+                  setConfirmPrayerId(isSelected ? lockedPrayer.id : null)
+                }
                 color="success"
+                classNames={{
+                  label: "text-grey",
+                }}
               >
-                i completed {lockedPrayer.name} salah and i&apos;m returning with discipline.
+                I completed {lockedPrayer.name} salah and I&apos;m returning with discipline.
               </Checkbox>
               <Button
                 color="success"
