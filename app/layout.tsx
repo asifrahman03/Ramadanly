@@ -42,7 +42,12 @@ const instrumentSerif = Instrument_Serif({
 });
 
 export const metadata: Metadata = {
-  title: "Ramadanly",
+  icons: {
+    icon: [{ url: "/favicon.ico" }, { url: "/icon", type: "image/png" }],
+    shortcut: ["/favicon.ico"],
+    apple: ["/icon"],
+  },
+  title: "ramadanly",
   description: "elite discipline for salah and focus",
   metadataBase: new URL("https://makesomething.so"),
   openGraph: {
