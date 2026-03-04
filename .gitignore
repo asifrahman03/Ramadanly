@@ -50,3 +50,8 @@ makesomething.json
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# AI & Agent configurations
+.agents/
+.claude/
+.codex/
