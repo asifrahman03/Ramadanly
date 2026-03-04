@@ -67,16 +67,7 @@ const REMINDER_OFFSETS_STORAGE_KEY = "ramadanly-reminder-offsets";
 const REMINDERS_ENABLED_STORAGE_KEY = "ramadanly-reminders-enabled";
 const ATHAN_FIRED_STORAGE_KEY = "ramadanly-athan-fired";
 const NOTIFICATION_TARGET_STORAGE_KEY = "ramadanly-notification-target";
-const pillarClasses = [
-  "h-32 w-10",
-  "h-44 w-12",
-  "h-36 w-11",
-  "h-48 w-14",
-  "h-40 w-10",
-  "h-44 w-12",
-  "h-36 w-11",
-  "h-48 w-14",
-];
+const ATHAN_GRACE_MINUTES = 15;
 
 const prayerCopy: Record<
   PrayerName,
@@ -555,6 +546,7 @@ export default function Home() {
   }, [
     clearReminderTimeouts,
     dayKey,
+    now,
     notificationPermission,
     prayerCards,
     reminderFired,
@@ -576,7 +568,7 @@ export default function Home() {
 
       const prayerMins = toMinutes(prayer.time24);
 
-      if (nowMins >= prayerMins && nowMins < prayerMins + 2) {
+      if (nowMins >= prayerMins && nowMins < prayerMins + ATHAN_GRACE_MINUTES) {
         sendAthanNotification(prayer);
         return;
       }
@@ -601,6 +593,7 @@ export default function Home() {
     athanFired,
     clearAthanTimeouts,
     dayKey,
+    now,
     notificationPermission,
     prayerCards,
     remindersEnabled,
@@ -747,14 +740,6 @@ export default function Home() {
                 </h1>
               </motion.div>
             </NextLink>
-            {/* <NextLink href={'/'} className="cursor-pointer">
-              <h1 className="mt-2 text-5xl font-bold tracking-tight text-white sm:text-6xl">
-                Rama
-                <span className="bg-gradient-to-r from-amber-300 to-amber-600 bg-clip-text text-transparent">
-                  danly
-                </span>
-              </h1>
-            </NextLink> */}
             <p className="mt-2 max-w-2xl text-sm text-white/70 sm:text-base">
               real winners never miss salah. your work pauses until you answer the call.
             </p>
