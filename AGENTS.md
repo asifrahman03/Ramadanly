@@ -27,7 +27,7 @@ never do these:
 
 ## guardrail mode (project state)
 
-`guardrail_mode: default`
+`guardrail_mode: advanced`
 
 - valid values are only `default` and `advanced`
 - this line is the project-wide source of truth for guardrail mode

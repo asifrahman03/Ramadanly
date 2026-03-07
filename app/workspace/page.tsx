@@ -59,6 +59,13 @@ type ReverseGeoResponse = {
   countryName?: string;
 };
 type SavedLocation = { city: string; country: string };
+type PushSubscriptionPayload = {
+  endpoint: string;
+  keys?: {
+    p256dh?: string;
+    auth?: string;
+  };
+};
 
 const ALADHAN_API_BASE_URL = "https://api.aladhan.com/v1/timingsByCity";
 const BIGDATACLOUD_BASE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client";
@@ -140,6 +147,19 @@ const defaultAthanFired: Record<PrayerName, boolean> = {
   asr: false,
   maghrib: false,
   isha: false,
+};
+
+const urlBase64ToUint8Array = (base64String: string) => {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+
+  for (let i = 0; i < rawData.length; i += 1) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+
+  return outputArray;
 };
 
 const statusStyle: Record<PrayerStatus, StatusColor> = {
@@ -295,12 +315,18 @@ export default function Home() {
   const [locationLine, setLocationLine] = useState("syncing your city prayer times...");
   const [timesError, setTimesError] = useState<string | null>(null);
   const [isLocating, setIsLocating] = useState(false);
+  const [pushSupported, setPushSupported] = useState(false);
+  const [pushSubscribed, setPushSubscribed] = useState(false);
+  const [pushEndpoint, setPushEndpoint] = useState<string | null>(null);
+  const [pushMessage, setPushMessage] = useState("");
+  const [isPushBusy, setIsPushBusy] = useState(false);
   const isDevMode = process.env.NODE_ENV !== "production";
 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const dragState = useRef({ isDown: false, startX: 0, scrollLeft: 0 });
   const reminderTimeoutsRef = useRef<number[]>([]);
   const athanTimeoutsRef = useRef<number[]>([]);
+  const pushRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
 
   const clearReminderTimeouts = useCallback(() => {
     reminderTimeoutsRef.current.forEach((timeoutId) => window.clearTimeout(timeoutId));
@@ -373,6 +399,56 @@ export default function Home() {
       setAthanFired((prev) => ({ ...prev, [prayer.id]: true }));
     },
     [redirectToPrayerWindow],
+  );
+
+  const getPushContext = useCallback(() => {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const savedLocationRaw = window.localStorage.getItem(LOCATION_STORAGE_KEY);
+    if (savedLocationRaw) {
+      try {
+        const parsed = JSON.parse(savedLocationRaw) as SavedLocation;
+        if (parsed.city && parsed.country) {
+          return {
+            city: parsed.city,
+            country: parsed.country,
+            timezone,
+          };
+        }
+      } catch {
+        // ignore malformed local value
+      }
+    }
+
+    return {
+      city: "New York",
+      country: "United States",
+      timezone,
+    };
+  }, []);
+
+  const syncPushSubscription = useCallback(
+    async (subscription: PushSubscription, forceRemindersEnabled?: boolean) => {
+      const payload = subscription.toJSON() as PushSubscriptionPayload;
+      const context = getPushContext();
+
+      const response = await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subscription: payload,
+          city: context.city,
+          country: context.country,
+          timezone: context.timezone,
+          reminderOffsets,
+          remindersEnabled: forceRemindersEnabled ?? remindersEnabled,
+        }),
+      });
+
+      if (!response.ok) throw new Error("subscription sync failed");
+      setPushSubscribed(true);
+      setPushEndpoint(payload.endpoint ?? null);
+    },
+    [getPushContext, reminderOffsets, remindersEnabled],
   );
 
   const loadPrayerTimes = useCallback(async () => {
@@ -482,6 +558,52 @@ export default function Home() {
     }
     setNotificationPermission(window.Notification.permission);
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setPushSupported(false);
+      return;
+    }
+
+    setPushSupported(true);
+    let cancelled = false;
+
+    const register = async () => {
+      try {
+        const registration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+        pushRegistrationRef.current = registration;
+        const existing = await registration.pushManager.getSubscription();
+        if (cancelled) return;
+        setPushSubscribed(Boolean(existing));
+        setPushEndpoint(existing?.endpoint ?? null);
+      } catch {
+        if (!cancelled) {
+          setPushMessage("push setup failed on this browser.");
+        }
+      }
+    };
+
+    void register();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pushSubscribed) return;
+    const registration = pushRegistrationRef.current;
+    if (!registration) return;
+
+    const syncExisting = async () => {
+      const current = await registration.pushManager.getSubscription();
+      if (!current) return;
+      await syncPushSubscription(current);
+    };
+
+    void syncExisting();
+  }, [pushSubscribed, reminderOffsets, remindersEnabled, syncPushSubscription]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -692,6 +814,108 @@ export default function Home() {
     setReminderMessage("reminders are on.");
   };
 
+  const subscribeToPush = async () => {
+    try {
+      setIsPushBusy(true);
+      setPushMessage("");
+      if (!pushSupported) {
+        setPushMessage("push is not supported in this browser.");
+        return;
+      }
+
+      if (notificationPermission !== "granted") {
+        const permission = await window.Notification.requestPermission();
+        setNotificationPermission(permission);
+        if (permission !== "granted") {
+          setPushMessage("notifications are blocked in browser settings.");
+          return;
+        }
+      }
+
+      const registration = pushRegistrationRef.current ?? (await navigator.serviceWorker.ready);
+      pushRegistrationRef.current = registration;
+
+      const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+      if (!publicKey) {
+        setPushMessage("missing public push key on this deployment.");
+        return;
+      }
+
+      const existing = await registration.pushManager.getSubscription();
+      const subscription =
+        existing ??
+        (await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        }));
+
+      setRemindersEnabled(true);
+      await syncPushSubscription(subscription, true);
+      setPushMessage("push is on for this browser.");
+    } catch {
+      setPushMessage("couldn’t subscribe this browser to push.");
+    } finally {
+      setIsPushBusy(false);
+    }
+  };
+
+  const unsubscribeFromPush = async () => {
+    try {
+      setIsPushBusy(true);
+      setPushMessage("");
+      const registration = pushRegistrationRef.current ?? (await navigator.serviceWorker.ready);
+      const subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        setPushSubscribed(false);
+        setPushEndpoint(null);
+        setPushMessage("push was already off.");
+        return;
+      }
+
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      });
+      await subscription.unsubscribe();
+      setPushSubscribed(false);
+      setPushEndpoint(null);
+      setPushMessage("push is off for this browser.");
+    } catch {
+      setPushMessage("couldn’t unsubscribe this browser.");
+    } finally {
+      setIsPushBusy(false);
+    }
+  };
+
+  const sendPushTest = async () => {
+    if (!pushEndpoint) {
+      setPushMessage("subscribe to push first.");
+      return;
+    }
+
+    try {
+      setIsPushBusy(true);
+      setPushMessage("");
+      const response = await fetch("/api/push/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: pushEndpoint }),
+      });
+
+      if (!response.ok) {
+        setPushMessage("test push failed on server.");
+        return;
+      }
+
+      setPushMessage("test push sent.");
+    } catch {
+      setPushMessage("test push failed.");
+    } finally {
+      setIsPushBusy(false);
+    }
+  };
+
   const triggerDevReminder = () => {
     const prayer = prayerCards.find((candidate) => candidate.id === devPrayerId);
     if (!prayer) return;
@@ -799,6 +1023,50 @@ export default function Home() {
                   </div>
                 </div>
                 {reminderMessage && <p className="text-xs text-white/70">{reminderMessage}</p>}
+                <div className="rounded-2xl border border-white/15 bg-black/20 p-3">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-xs uppercase tracking-[0.2em] text-white/65">background push</p>
+                    <Chip
+                      variant="flat"
+                      className={
+                        pushSupported
+                          ? pushSubscribed
+                            ? "bg-green-300/20 text-green-200 border border-green-300/30"
+                            : "bg-amber-300/20 text-amber-200 border border-amber-300/30"
+                          : "bg-rose-300/20 text-rose-200 border border-rose-300/30"
+                      }
+                    >
+                      {!pushSupported ? "unsupported" : pushSubscribed ? "subscribed" : "not subscribed"}
+                    </Chip>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      className="bg-amber-300/20 text-amber-100 border border-amber-200/35"
+                      onPress={() => void subscribeToPush()}
+                      isLoading={isPushBusy}
+                    >
+                      subscribe push
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="bg-white/5 text-white border border-white/20"
+                      onPress={() => void unsubscribeFromPush()}
+                      isDisabled={!pushSubscribed || isPushBusy}
+                    >
+                      unsubscribe
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="bg-white/5 text-white border border-white/20"
+                      onPress={() => void sendPushTest()}
+                      isDisabled={!pushSubscribed || isPushBusy}
+                    >
+                      send test push
+                    </Button>
+                  </div>
+                  {pushMessage && <p className="mt-2 text-xs text-white/70">{pushMessage}</p>}
+                </div>
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5">
                   {prayerCards.map((prayer) => (
                     <Input
